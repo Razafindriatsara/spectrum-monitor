@@ -70,10 +70,7 @@ impl SimulatedSource {
         let fs = 2.4e6;
         let mut rng = StdRng::seed_from_u64(seed);
         let first_gap = |rng: &mut StdRng| (rng.random_range(0.2..1.5) * fs) as usize;
-        let ais = [
-            BurstChannel::new(-25_000.0, first_gap(&mut rng)),
-            BurstChannel::new(25_000.0, first_gap(&mut rng)),
-        ];
+        let ais = [BurstChannel::new(-25_000.0, first_gap(&mut rng)), BurstChannel::new(25_000.0, first_gap(&mut rng))];
         Self {
             fs,
             fc: 162.0e6,

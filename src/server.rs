@@ -4,12 +4,12 @@
 //! (JSON), danach pro Frame eine Binärnachricht mit `f32`-Werten in dBFS,
 //! Little Endian, von der niedrigsten zur höchsten Frequenz.
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::Router;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 

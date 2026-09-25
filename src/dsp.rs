@@ -85,9 +85,7 @@ mod tests {
     use super::*;
 
     fn tone(n: usize, len: usize, bin: f32, amp: f32) -> Vec<Complex32> {
-        (0..len)
-            .map(|i| Complex32::from_polar(amp, 2.0 * PI * bin * i as f32 / n as f32))
-            .collect()
+        (0..len).map(|i| Complex32::from_polar(amp, 2.0 * PI * bin * i as f32 / n as f32)).collect()
     }
 
     fn argmax(v: &[f32]) -> usize {
