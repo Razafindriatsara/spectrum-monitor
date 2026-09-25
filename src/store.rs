@@ -2,7 +2,7 @@
 //! verlauf pro Schiff und der zusammengeführte letzte Stand jedes Schiffs.
 
 use crate::ais::message::AisMessage;
-use api::{MessageLog, Vessel};
+use api::{MessageLog, TrackPoint, Vessel};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 const SCHEMA: &str = "
@@ -97,6 +97,38 @@ impl Store {
         tx.commit()?;
         Ok(vessel)
     }
+
+    pub fn vessels(&self) -> rusqlite::Result<Vec<Vessel>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {VESSEL_COLUMNS} FROM vessels ORDER BY mmsi"))?;
+        stmt.query_map([], vessel_from_row)?.collect()
+    }
+
+    /// Die letzten `limit` Positionen, älteste zuerst.
+    pub fn track(&self, mmsi: u32, limit: u32) -> rusqlite::Result<Vec<TrackPoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, lat, lon FROM (
+                 SELECT ts_ms, lat, lon FROM positions WHERE mmsi = ?1 ORDER BY ts_ms DESC LIMIT ?2
+             ) ORDER BY ts_ms",
+        )?;
+        stmt.query_map(params![mmsi, limit], |r| Ok(TrackPoint { ts_ms: r.get(0)?, lat: r.get(1)?, lon: r.get(2)? }))?
+            .collect()
+    }
+
+    /// Die letzten `limit` Nachrichten, neueste zuerst.
+    pub fn messages(&self, limit: u32) -> rusqlite::Result<Vec<MessageLog>> {
+        let mut stmt =
+            self.conn.prepare("SELECT ts_ms, channel, mmsi, msg_type, nmea FROM messages ORDER BY id DESC LIMIT ?1")?;
+        stmt.query_map([limit], |r| {
+            Ok(MessageLog {
+                ts_ms: r.get(0)?,
+                channel: r.get::<_, String>(1)?.chars().next().unwrap_or('?'),
+                mmsi: r.get(2)?,
+                msg_type: r.get(3)?,
+                nmea: r.get::<_, String>(4)?.lines().map(str::to_string).collect(),
+            })
+        })?
+        .collect()
+    }
 }
 
 const VESSEL_COLUMNS: &str = "mmsi, name, callsign, ship_type, destination, length_m, beam_m, \
@@ -140,5 +172,19 @@ mod tests {
         assert_eq!(v.length_m, Some(70));
         assert!((v.lat.unwrap() - 54.3721).abs() < 1e-6);
         assert_eq!((v.messages, v.last_seen_ms), (2, 2000));
+        assert_eq!(db.vessels().unwrap(), vec![v]);
+    }
+
+    #[test]
+    fn verlauf_liefert_die_juengsten_punkte_in_zeitfolge() {
+        let mut db = Store::open(":memory:").unwrap();
+        for t in 1..=5 {
+            db.record(&log(t * 1000, 1), Some(&position())).unwrap();
+        }
+        let track = db.track(211_234_560, 3).unwrap();
+        assert_eq!(track.iter().map(|p| p.ts_ms).collect::<Vec<_>>(), vec![3000, 4000, 5000]);
+        let msgs = db.messages(2).unwrap();
+        assert_eq!(msgs[0].ts_ms, 5000);
+        assert_eq!(msgs[0].nmea, log(0, 1).nmea);
     }
 }

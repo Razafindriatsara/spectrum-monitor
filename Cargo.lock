@@ -972,6 +972,7 @@ dependencies = [
  "rand_distr",
  "rusqlite",
  "rustfft",
+ "serde",
  "serde_json",
  "tokio",
 ]

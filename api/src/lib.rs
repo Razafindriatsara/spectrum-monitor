@@ -4,6 +4,10 @@
 //! Endpunkte:
 //! - `GET /ws`: WebSocket mit [`SpectrumMeta`] als Text, danach pro Frame
 //!   `f32`-Werte in dBFS als Binärnachricht, Little Endian.
+//! - `GET /ws/ais`: WebSocket mit einem [`AisEvent`] (JSON) pro dekodierter Nachricht.
+//! - `GET /api/vessels`: alle bekannten Schiffe als `Vec<Vessel>`.
+//! - `GET /api/vessels/{mmsi}/track?limit=N`: Positionsverlauf als `Vec<TrackPoint>`.
+//! - `GET /api/messages?limit=N`: letzte Nachrichten als `Vec<MessageLog>`, neueste zuerst.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +47,13 @@ pub struct Vessel {
     pub messages: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrackPoint {
+    pub ts_ms: i64,
+    pub lat: f64,
+    pub lon: f64,
+}
+
 /// Eine empfangene Nachricht, wie sie im Ereignisprotokoll steht.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MessageLog {
@@ -53,4 +64,12 @@ pub struct MessageLog {
     pub msg_type: u8,
     /// NMEA-0183-Sätze (`!AIVDM`), wie sie auch per UDP ausgegeben werden.
     pub nmea: Vec<String>,
+}
+
+/// Wird pro dekodierter Nachricht über `/ws/ais` verteilt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AisEvent {
+    pub message: MessageLog,
+    /// Stand des Schiffs nach dieser Nachricht.
+    pub vessel: Vessel,
 }

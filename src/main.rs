@@ -11,7 +11,7 @@ use dsp::{Detector, SpectrumEstimator};
 use rustfft::num_complex::Complex32;
 use source::{IqSource, SimulatedSource};
 use std::net::UdpSocket;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::broadcast;
@@ -58,7 +58,7 @@ async fn main() {
         fps: args.fps,
         detector: format!("{:?}", args.detector),
     };
-    let store = Store::open(&args.db).expect("Datenbank lässt sich nicht öffnen");
+    let store = Arc::new(Mutex::new(Store::open(&args.db).expect("Datenbank lässt sich nicht öffnen")));
     let udp = args.nmea_udp.map(|target| {
         let socket = UdpSocket::bind("0.0.0.0:0").expect("UDP-Socket");
         socket.connect(&target).expect("ungültiges NMEA-Ziel");
@@ -66,15 +66,21 @@ async fn main() {
     });
 
     let (tx, _) = broadcast::channel::<Bytes>(16);
+    let (ais_tx, _) = broadcast::channel(256);
     let (frame_tx, frame_rx) = mpsc::channel();
 
     let producer = tx.clone();
     let (fps, detector) = (args.fps, args.detector);
     std::thread::spawn(move || acquisition_loop(source, estimator, receiver, fps, detector, producer, frame_tx));
-    std::thread::spawn(move || ais_pipeline(frame_rx, store, udp));
+    let (events, db) = (ais_tx.clone(), store.clone());
+    std::thread::spawn(move || ais_pipeline(frame_rx, db, events, udp));
 
-    let meta_json = serde_json::to_string(&meta).expect("serialisierbar");
-    let app = server::router(server::AppState { frames: tx, meta_json });
+    let app = server::router(server::AppState {
+        frames: tx,
+        meta_json: serde_json::to_string(&meta).expect("serialisierbar").into(),
+        ais_events: ais_tx,
+        store,
+    });
     let listener = tokio::net::TcpListener::bind(&args.bind).await.expect("Adresse ist belegt");
     println!("Spektrum und AIS laufen auf http://{}", args.bind);
     axum::serve(listener, app).await.expect("Server-Fehler");
@@ -124,9 +130,14 @@ fn acquisition_loop(
     }
 }
 
-/// Dekodiert empfangene Rahmen, speichert sie und gibt sie als NMEA aus. Läuft
+/// Dekodiert empfangene Rahmen, speichert sie und verteilt sie weiter. Läuft
 /// in eigenem Thread, damit Plattenzugriffe die Erfassung nicht aufhalten.
-fn ais_pipeline(frames: mpsc::Receiver<ReceivedFrame>, mut store: Store, udp: Option<UdpSocket>) {
+fn ais_pipeline(
+    frames: mpsc::Receiver<ReceivedFrame>,
+    store: Arc<Mutex<Store>>,
+    events: broadcast::Sender<Arc<str>>,
+    udp: Option<UdpSocket>,
+) {
     let mut seq_id = 0u8;
     for frame in frames {
         let Some(mmsi) = ais::message::peek_mmsi(&frame.payload) else { continue };
@@ -144,8 +155,14 @@ fn ais_pipeline(frames: mpsc::Receiver<ReceivedFrame>, mut store: Store, udp: Op
                 let _ = socket.send(format!("{line}\r\n").as_bytes());
             }
         }
-        if let Err(e) = store.record(&message, decoded.as_ref()) {
-            eprintln!("Speichern fehlgeschlagen: {e}");
-        }
+        let vessel = match store.lock().expect("Datenbank-Mutex vergiftet").record(&message, decoded.as_ref()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Speichern fehlgeschlagen: {e}");
+                continue;
+            }
+        };
+        let event = api::AisEvent { message, vessel };
+        let _ = events.send(serde_json::to_string(&event).expect("serialisierbar").into());
     }
 }
