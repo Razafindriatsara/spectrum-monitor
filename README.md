@@ -1,5 +1,11 @@
 # Spectrum Monitor
 
+![Spektrum und Wasserfall](docs/screenshot.png)
+
+*Oben das Live-Spektrum (gelb) mit Max-Hold (gestrichelt), unten der Wasserfall.
+Max-Hold macht sichtbar, was im Momentbild fehlt: die beiden AIS-Kanäle in der
+Mitte und den gesamten Bereich, den der Frequenzspringer rechts belegt.*
+
 Echtzeit-Spektrumüberwachung in Rust: IQ-Samples rein, Spektrum und Wasserfall
 live im Browser. Heute mit einem Signalsimulator für das AIS-Band um 162 MHz,
 später mit echtem Empfang über einen RTL-SDR.
