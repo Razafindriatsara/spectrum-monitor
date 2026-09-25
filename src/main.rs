@@ -37,15 +37,15 @@ async fn main() {
     let source = SimulatedSource::new(args.seed);
     let estimator = SpectrumEstimator::new(args.fft_size);
 
-    let meta_json = format!(
-        r#"{{"center_hz":{},"sample_rate":{},"fft_size":{},"rbw_hz":{},"fps":{},"detector":"{:?}"}}"#,
-        source.center_freq(),
-        source.sample_rate(),
-        estimator.size(),
-        estimator.rbw(source.sample_rate()),
-        args.fps,
-        args.detector,
-    );
+    let meta = api::SpectrumMeta {
+        center_hz: source.center_freq(),
+        sample_rate: source.sample_rate(),
+        fft_size: estimator.size(),
+        rbw_hz: estimator.rbw(source.sample_rate()),
+        fps: args.fps,
+        detector: format!("{:?}", args.detector),
+    };
+    let meta_json = serde_json::to_string(&meta).expect("serialisierbar");
 
     let (tx, _) = broadcast::channel::<Bytes>(16);
     let producer = tx.clone();

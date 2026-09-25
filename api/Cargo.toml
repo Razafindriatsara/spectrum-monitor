@@ -1,0 +1,8 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2024"
+description = "Gemeinsame Datentypen von Server und Frontend"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
