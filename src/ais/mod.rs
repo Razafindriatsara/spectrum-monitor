@@ -7,6 +7,7 @@
 
 mod bits;
 pub mod demod;
+pub mod fleet;
 pub mod frame;
 pub mod gmsk;
 pub mod message;

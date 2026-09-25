@@ -2,10 +2,12 @@
 //! [`IqSource`]. Heute gibt es den Simulator, später kommt ein RTL-SDR dazu,
 //! ohne dass sich DSP oder Server ändern müssen.
 
+use crate::ais::{self, Channel, fleet::Fleet, gmsk::BAUD};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use rustfft::num_complex::Complex32;
+use std::collections::VecDeque;
 use std::f64::consts::TAU;
 
 pub trait IqSource: Send {
@@ -29,14 +31,20 @@ impl Nco {
     }
 }
 
-/// FSK-Bursts nach Art von AIS: 9600 Baud, ±2,4 kHz Hub, 26,7 ms lang.
-struct BurstChannel {
+/// Ein AIS-Kanal: sendet fertig modulierte Bursts nacheinander, mit mindestens
+/// einem Zeitschlitz Abstand, damit sich Aussendungen nicht überlagern.
+struct AisChannel {
     offset: f64,
     nco: Nco,
-    remaining: usize,
-    until_next: usize,
-    bit_left: usize,
-    bit: bool,
+    queue: VecDeque<Burst>,
+    current: Option<Burst>,
+    pos: usize,
+    guard: usize,
+}
+
+struct Burst {
+    freq: Vec<f32>,
+    amplitude: f32,
 }
 
 /// Frequenzspringer: wechselt alle 50 ms auf eine zufällige Frequenz.
@@ -55,25 +63,34 @@ pub struct SimulatedSource {
     fm: Nco,
     fm_mod: Nco,
     hopper: Hopper,
-    ais: [BurstChannel; 2],
+    fleet: Fleet,
+    ais: [AisChannel; 2],
 }
 
-const BAUD: f64 = 9600.0;
-const FSK_DEV: f64 = 2400.0;
-const BURST_S: f64 = 0.02667;
 const HOP_S: f64 = 0.05;
+/// Ein AIS-Zeitschlitz dauert 60 s / 2250.
+const SLOT_S: f64 = 60.0 / 2250.0;
 
 impl SimulatedSource {
     /// Simuliert 2,4 MHz um 162 MHz, also das AIS-Band mit beiden Kanälen
-    /// (161,975 und 162,025 MHz) plus einigen weiteren Sendern.
+    /// (161,975 und 162,025 MHz), dort den Schiffsverkehr der Kieler Förde,
+    /// plus einige weitere Sender.
     pub fn new(seed: u64) -> Self {
         let fs = 2.4e6;
+        let fc = 162.0e6;
         let mut rng = StdRng::seed_from_u64(seed);
-        let first_gap = |rng: &mut StdRng| (rng.random_range(0.2..1.5) * fs) as usize;
-        let ais = [BurstChannel::new(-25_000.0, first_gap(&mut rng)), BurstChannel::new(25_000.0, first_gap(&mut rng))];
+        let ais = [Channel::A, Channel::B].map(|ch| AisChannel {
+            offset: ch.freq_hz() - fc,
+            nco: Nco { phase: 0.0 },
+            queue: VecDeque::new(),
+            current: None,
+            pos: 0,
+            guard: 0,
+        });
         Self {
             fs,
-            fc: 162.0e6,
+            fc,
+            fleet: Fleet::kiel(&mut rng),
             noise: Normal::new(0.0, 0.003).expect("gültige Standardabweichung"),
             carrier: Nco { phase: 0.0 },
             fm: Nco { phase: 0.0 },
@@ -85,29 +102,28 @@ impl SimulatedSource {
     }
 }
 
-impl BurstChannel {
-    fn new(offset: f64, until_next: usize) -> Self {
-        Self { offset, nco: Nco { phase: 0.0 }, remaining: 0, until_next, bit_left: 0, bit: false }
-    }
-
-    fn next(&mut self, fs: f64, rng: &mut StdRng) -> Complex32 {
-        if self.remaining == 0 {
-            if self.until_next > 0 {
-                self.until_next -= 1;
+impl AisChannel {
+    fn next(&mut self, fs: f64) -> Complex32 {
+        if self.current.is_none() {
+            if self.guard > 0 {
+                self.guard -= 1;
                 return Complex32::ZERO;
             }
-            // Neuer Burst beginnt, nächste Pause wird schon ausgewürfelt.
-            self.remaining = (BURST_S * fs) as usize;
-            self.until_next = (rng.random_range(0.4..2.5) * fs) as usize;
+            self.current = self.queue.pop_front();
+            self.pos = 0;
         }
-        if self.bit_left == 0 {
-            self.bit = rng.random_bool(0.5);
-            self.bit_left = (fs / BAUD) as usize;
+        let Some(burst) = &self.current else { return Complex32::ZERO };
+        // Weiche Flanken über eine Bitdauer, wie beim Sender vorgeschrieben.
+        let ramp = (fs / BAUD) as usize;
+        let edge = self.pos.min(burst.freq.len() - 1 - self.pos).min(ramp);
+        let v = self.nco.next(self.offset + f64::from(burst.freq[self.pos]), fs)
+            * (burst.amplitude * edge as f32 / ramp as f32);
+        self.pos += 1;
+        if self.pos == burst.freq.len() {
+            self.current = None;
+            self.guard = (SLOT_S * fs) as usize;
         }
-        self.bit_left -= 1;
-        self.remaining -= 1;
-        let dev = if self.bit { FSK_DEV } else { -FSK_DEV };
-        self.nco.next(self.offset + dev, fs) * 0.08
+        v
     }
 }
 
@@ -122,6 +138,11 @@ impl IqSource for SimulatedSource {
 
     fn read(&mut self, buf: &mut [Complex32]) {
         let fs = self.fs;
+        let sps = (fs / BAUD).round() as usize;
+        for (msg, ch, amplitude) in self.fleet.advance(buf.len() as f64 / fs, &mut self.rng) {
+            let freq = ais::modulate(&msg.encode(), sps);
+            self.ais[ch as usize].queue.push_back(Burst { freq, amplitude });
+        }
         for s in buf.iter_mut() {
             // Dauerträger, z. B. eine Bake.
             let mut v = self.carrier.next(-600_000.0, fs) * 0.05;
@@ -139,11 +160,37 @@ impl IqSource for SimulatedSource {
             v += self.hopper.nco.next(self.hopper.freq, fs) * 0.01;
 
             for ch in &mut self.ais {
-                v += ch.next(fs, &mut self.rng);
+                v += ch.next(fs);
             }
 
             v += Complex32::new(self.noise.sample(&mut self.rng), self.noise.sample(&mut self.rng));
             *s = v;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ais::{AisMessage, AisReceiver};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn empfaenger_hoert_die_ganze_flotte() {
+        let mut src = SimulatedSource::new(7);
+        let mut rx = AisReceiver::new(src.sample_rate(), src.center_freq());
+        let mut buf = vec![Complex32::ZERO; 96_000];
+        let mut names = BTreeSet::new();
+        // 12 s Signalzeit: jedes Schiff sendet in den ersten 5 s seine Stammdaten.
+        for _ in 0..300 {
+            src.read(&mut buf);
+            for f in rx.process(&buf) {
+                if let Ok(AisMessage::Static(s)) = AisMessage::decode(&f.payload) {
+                    names.insert(s.name);
+                }
+            }
+        }
+        let expected = ["BALTIC AMBER", "LABOE", "MOEWE", "NORDLICHT", "SCHWENTINE", "SPROTTE"];
+        assert_eq!(names, expected.map(String::from).into());
     }
 }
