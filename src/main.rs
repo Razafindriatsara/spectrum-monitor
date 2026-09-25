@@ -1,3 +1,6 @@
+// Wird erst mit der AIS-Pipeline in main verdrahtet, bis dahin nur in Tests genutzt.
+#[allow(dead_code, unused_imports)]
+mod ais;
 mod dsp;
 mod server;
 mod source;
