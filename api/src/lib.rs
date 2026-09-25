@@ -47,6 +47,21 @@ pub struct Vessel {
     pub messages: u32,
 }
 
+impl Vessel {
+    /// Name, falls bekannt, sonst die MMSI.
+    pub fn label(&self) -> String {
+        match &self.name {
+            Some(n) if !n.is_empty() => n.clone(),
+            _ => self.mmsi.to_string(),
+        }
+    }
+
+    /// Richtung für die Kartendarstellung: Steuerkurs, ersatzweise Kurs über Grund.
+    pub fn bearing(&self) -> Option<f32> {
+        self.heading.map(f32::from).or(self.cog)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackPoint {
     pub ts_ms: i64,
@@ -72,4 +87,40 @@ pub struct AisEvent {
     pub message: MessageLog,
     /// Stand des Schiffs nach dieser Nachricht.
     pub vessel: Vessel,
+}
+
+/// Navigationsstatus nach ITU-R M.1371.
+pub fn nav_status_text(status: u8) -> &'static str {
+    match status {
+        0 => "In Fahrt unter Maschine",
+        1 => "Vor Anker",
+        2 => "Manövrierunfähig",
+        3 => "Manövrierbehindert",
+        4 => "Tiefgangbehindert",
+        5 => "Festgemacht",
+        6 => "Auf Grund",
+        7 => "Beim Fischen",
+        8 => "In Fahrt unter Segeln",
+        _ => "Nicht angegeben",
+    }
+}
+
+/// Grobe Schiffsart aus dem AIS-Typcode.
+pub fn ship_type_text(code: u8) -> &'static str {
+    match code {
+        30 => "Fischerei",
+        31 | 32 | 52 => "Schlepper",
+        35 => "Marine",
+        36 => "Segelfahrzeug",
+        37 => "Sportboot",
+        40..=49 => "Hochgeschwindigkeitsfahrzeug",
+        50 => "Lotsenfahrzeug",
+        51 => "Such- und Rettungsfahrzeug",
+        53 => "Hafenfahrzeug",
+        55 => "Behördenfahrzeug",
+        60..=69 => "Fahrgastschiff",
+        70..=79 => "Frachtschiff",
+        80..=89 => "Tanker",
+        _ => "Sonstiges",
+    }
 }

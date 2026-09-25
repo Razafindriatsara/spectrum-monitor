@@ -1,4 +1,4 @@
-//! HTTP und WebSocket: liefert die Oberfläche aus, streamt Spektren und
+//! HTTP und WebSocket: liefert das Leptos-Frontend aus, streamt Spektren und
 //! AIS-Ereignisse und beantwortet Abfragen an die Datenbank. Das Protokoll ist
 //! in der Crate `api` beschrieben.
 
@@ -7,9 +7,10 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Json};
+use axum::http::{StatusCode, Uri, header};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -23,15 +24,39 @@ pub struct AppState {
     pub store: Arc<Mutex<Store>>,
 }
 
+/// Mit `trunk build --release` in `frontend/` erzeugt. Im Release-Build steckt
+/// es im Binary, im Debug-Build wird es bei jeder Anfrage von der Platte gelesen.
+#[derive(RustEmbed)]
+#[folder = "frontend/dist/"]
+#[allow_missing = true]
+struct Frontend;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("../web/index.html")) }))
         .route("/ws", get(spectrum_ws))
         .route("/ws/ais", get(ais_ws))
         .route("/api/vessels", get(vessels))
         .route("/api/vessels/{mmsi}/track", get(track))
         .route("/api/messages", get(messages))
+        .fallback(get(frontend))
         .with_state(state)
+}
+
+async fn frontend(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    match Frontend::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], file.data).into_response()
+        }
+        None if path == "index.html" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html("<h1>Frontend fehlt</h1><p>Erst <code>cd frontend &amp;&amp; trunk build --release</code>, dann den Server neu bauen.</p>"),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn spectrum_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
