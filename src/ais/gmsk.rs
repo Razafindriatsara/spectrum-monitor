@@ -8,31 +8,34 @@ const BT: f64 = 0.4;
 /// Momentanfrequenz in Hz pro Sample, relativ zur Kanalmitte.
 ///
 /// Jeder Pegel trägt einen Rechteckpuls von einer Bitdauer bei, gefaltet mit
-/// dem Gaußfilter. Das ergibt die Differenz zweier Normalverteilungen.
+/// dem Gaußfilter. Das ergibt die Differenz zweier Normalverteilungen. Der
+/// Puls ist für jedes Bit gleich und nach zwei Bitdauern abgeklungen; er wird
+/// deshalb einmal über fünf Bitdauern tabelliert und dann nur noch aufaddiert.
 pub fn frequency(levels: &[bool], samples_per_bit: usize) -> Vec<f32> {
-    let sps = samples_per_bit as f64;
+    let sps = samples_per_bit;
     let sigma = 2f64.ln().sqrt() / (std::f64::consts::TAU * BT); // in Bitdauern
-    let pulse = |t: f64| phi((t + 0.5) / sigma) - phi((t - 0.5) / sigma);
-    let a = |k: isize| match levels.get(k as usize) {
-        Some(&l) if k >= 0 => {
-            if l {
-                1.0
-            } else {
-                -1.0
+    // Stützstelle m liegt (m + 0,5)/sps − 2,5 Bitdauern nach der Bitmitte.
+    let pulse: Vec<f32> = (0..5 * sps)
+        .map(|m| {
+            let t = (m as f64 + 0.5) / sps as f64 - 2.5;
+            ((phi((t + 0.5) / sigma) - phi((t - 0.5) / sigma)) * DEVIATION_HZ) as f32
+        })
+        .collect();
+
+    let len = levels.len() * sps;
+    let mut freq = vec![0.0f32; len];
+    for (k, &level) in levels.iter().enumerate() {
+        let sign = if level { 1.0 } else { -1.0 };
+        // Der Puls von Bit k beginnt zwei Bitdauern vor dessen Anfang.
+        let start = k as isize * sps as isize - 2 * sps as isize;
+        for (m, p) in pulse.iter().enumerate() {
+            let n = start + m as isize;
+            if (0..len as isize).contains(&n) {
+                freq[n as usize] += sign * p;
             }
         }
-        _ => 0.0,
-    };
-
-    (0..levels.len() * samples_per_bit)
-        .map(|n| {
-            let t = (n as f64 + 0.5) / sps; // Zeit in Bitdauern
-            let k0 = t.floor() as isize;
-            // Der Puls ist nach zwei Bitdauern praktisch abgeklungen.
-            let f: f64 = (k0 - 2..=k0 + 2).map(|k| a(k) * pulse(t - k as f64 - 0.5)).sum();
-            (f * DEVIATION_HZ) as f32
-        })
-        .collect()
+    }
+    freq
 }
 
 /// Verteilungsfunktion der Standardnormalverteilung.
