@@ -1,15 +1,12 @@
-mod ais;
-mod dsp;
 mod server;
-mod source;
 mod store;
 
-use ais::{AisMessage, AisReceiver, ReceivedFrame, nmea};
 use axum::body::Bytes;
 use clap::Parser;
-use dsp::{Detector, SpectrumEstimator};
 use rustfft::num_complex::Complex32;
-use source::{IqSource, SimulatedSource};
+use spectrum_monitor::ais::{self, AisMessage, AisReceiver, ReceivedFrame, nmea};
+use spectrum_monitor::dsp::{Detector, SpectrumEstimator};
+use spectrum_monitor::source::{IqSource, SimulatedSource};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

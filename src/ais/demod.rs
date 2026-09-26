@@ -1,21 +1,21 @@
 //! AIS-Empfänger für beide Kanäle. Pro Kanal:
 //!
-//! 1. Mischen: Kanalmitte nach 0 Hz verschieben.
-//! 2. Zweistufig filtern und dezimieren, zum Beispiel 2,4 MHz → 240 kHz → 48 kHz,
-//!    also fünf Samples pro Bit. Die zweite Stufe trennt die Kanäle A und B.
-//! 3. FM-Diskriminator: Phasendifferenz aufeinanderfolgender Samples.
-//! 4. Taktrückgewinnung: Nulldurchgänge ziehen den Abtastzeitpunkt in die Bitmitte.
-//! 5. NRZI-Dekodierung und HDLC-Rahmensuche mit CRC-Prüfung.
+//! 1. [`Downconverter`]: Kanalmitte nach 0 Hz mischen und auf 48 kHz
+//!    dezimieren, also fünf Samples pro Bit. Das Kanalfilter trennt A und B.
+//! 2. FM-Diskriminator: Phasendifferenz aufeinanderfolgender Samples.
+//! 3. Taktrückgewinnung: Nulldurchgänge ziehen den Abtastzeitpunkt in die Bitmitte.
+//! 4. NRZI-Dekodierung und HDLC-Rahmensuche mit CRC-Prüfung.
 
 use super::Channel;
 use super::frame::Deframer;
 use super::gmsk::{BAUD, DEVIATION_HZ};
+use crate::dsp::{Downconverter, NARROW_RATE};
 use rustfft::num_complex::Complex32;
 use std::f64::consts::TAU;
 
-const STAGE1_RATE: f64 = 240_000.0;
-const STAGE2_DECIM: usize = 5;
-const SPS: f32 = (STAGE1_RATE / STAGE2_DECIM as f64 / BAUD) as f32;
+const SPS: f32 = (NARROW_RATE / BAUD) as f32;
+/// Grenzfrequenz des Kanalfilters; der Nachbarkanal liegt 50 kHz daneben.
+const CHANNEL_CUTOFF_HZ: f64 = 10_000.0;
 /// Anteil des Taktfehlers, der pro Nulldurchgang korrigiert wird.
 const CLOCK_GAIN: f32 = 0.3;
 
@@ -35,17 +35,12 @@ impl AisReceiver {
     /// Die Abtastrate muss ein ganzzahliges Vielfaches von 240 kHz sein, und
     /// beide Kanäle müssen im erfassten Band liegen.
     pub fn new(sample_rate: f64, center_freq: f64) -> Self {
-        let decim = (sample_rate / STAGE1_RATE).round() as usize;
-        assert!(
-            decim >= 1 && (decim as f64 * STAGE1_RATE - sample_rate).abs() < 1.0,
-            "Abtastrate muss ein Vielfaches von 240 kHz sein, ist {sample_rate} Hz"
-        );
         let channels = [Channel::A, Channel::B]
             .into_iter()
             .map(|ch| {
                 let offset = ch.freq_hz() - center_freq;
                 assert!(offset.abs() < 0.45 * sample_rate, "Kanal {ch:?} liegt außerhalb des Bandes");
-                ChannelReceiver::new(ch, offset, sample_rate, decim)
+                ChannelReceiver::new(ch, offset, sample_rate)
             })
             .collect();
         Self { channels }
@@ -62,11 +57,7 @@ impl AisReceiver {
 
 struct ChannelReceiver {
     channel: Channel,
-    mixer: Complex32,
-    mixer_step: Complex32,
-    mixed: usize,
-    stage1: Decimator,
-    stage2: Decimator,
+    down: Downconverter,
     prev: Complex32,
     disc_scale: f32,
     clock: f32,
@@ -74,55 +65,29 @@ struct ChannelReceiver {
     last_level: bool,
     deframer: Deframer,
     // Zwischenpuffer, damit pro Block nichts neu alloziert wird.
-    buf1: Vec<Complex32>,
-    buf2: Vec<Complex32>,
+    narrow: Vec<Complex32>,
 }
 
 impl ChannelReceiver {
-    fn new(channel: Channel, offset: f64, sample_rate: f64, decim: usize) -> Self {
-        let step = -TAU * offset / sample_rate;
+    fn new(channel: Channel, offset: f64, sample_rate: f64) -> Self {
         Self {
             channel,
-            mixer: Complex32::new(1.0, 0.0),
-            mixer_step: Complex32::new(step.cos() as f32, step.sin() as f32),
-            mixed: 0,
-            // Stufe 1 muss nur verhindern, dass etwas in die Durchlassbreite von
-            // Stufe 2 faltet; Stufe 2 unterdrückt den Nachbarkanal 50 kHz daneben.
-            stage1: Decimator::new(lowpass(64, 60_000.0 / sample_rate), decim),
-            stage2: Decimator::new(lowpass(96, 10_000.0 / STAGE1_RATE), STAGE2_DECIM),
+            down: Downconverter::new(offset, sample_rate, CHANNEL_CUTOFF_HZ),
             prev: Complex32::ZERO,
-            disc_scale: (STAGE1_RATE / STAGE2_DECIM as f64 / (TAU * DEVIATION_HZ)) as f32,
+            disc_scale: (NARROW_RATE / (TAU * DEVIATION_HZ)) as f32,
             clock: 0.0,
             last_sign: false,
             last_level: false,
             deframer: Deframer::default(),
-            buf1: Vec::new(),
-            buf2: Vec::new(),
+            narrow: Vec::new(),
         }
     }
 
     fn process(&mut self, samples: &[Complex32], out: &mut Vec<ReceivedFrame>) {
-        self.buf1.clear();
-        for &s in samples {
-            let mixed = s * self.mixer;
-            self.mixer *= self.mixer_step;
-            self.mixed += 1;
-            if self.mixed.is_multiple_of(4096) {
-                // Rundungsfehler würden den Betrag langsam wegdriften lassen.
-                self.mixer /= self.mixer.norm();
-            }
-            if let Some(y) = self.stage1.push(mixed) {
-                self.buf1.push(y);
-            }
-        }
-        self.buf2.clear();
-        for i in 0..self.buf1.len() {
-            if let Some(y) = self.stage2.push(self.buf1[i]) {
-                self.buf2.push(y);
-            }
-        }
-        for i in 0..self.buf2.len() {
-            let x = self.buf2[i];
+        self.narrow.clear();
+        self.down.process(samples, &mut self.narrow);
+        for i in 0..self.narrow.len() {
+            let x = self.narrow[i];
             // Normierte Frequenz: ±1 entspricht dem vollen Hub von ±2,4 kHz.
             let f = (x * self.prev.conj()).arg() * self.disc_scale;
             self.prev = x;
@@ -152,55 +117,10 @@ impl ChannelReceiver {
     }
 }
 
-/// FIR-Tiefpass mit Dezimation: berechnet nur jedes `factor`-te Ausgangssample.
-struct Decimator {
-    taps: Vec<f32>,
-    /// Ringpuffer doppelter Länge, damit das Fenster immer zusammenhängend ist.
-    hist: Vec<Complex32>,
-    pos: usize,
-    factor: usize,
-    phase: usize,
-}
-
-impl Decimator {
-    fn new(taps: Vec<f32>, factor: usize) -> Self {
-        Self { hist: vec![Complex32::ZERO; 2 * taps.len()], taps, pos: 0, factor, phase: 0 }
-    }
-
-    fn push(&mut self, x: Complex32) -> Option<Complex32> {
-        let n = self.taps.len();
-        self.hist[self.pos] = x;
-        self.hist[self.pos + n] = x;
-        self.pos = (self.pos + 1) % n;
-        self.phase += 1;
-        if self.phase < self.factor {
-            return None;
-        }
-        self.phase = 0;
-        let window = &self.hist[self.pos..self.pos + n];
-        Some(window.iter().zip(&self.taps).map(|(x, t)| x * t).sum())
-    }
-}
-
-/// Gefensterter Sinc-Tiefpass (Blackman), Grenzfrequenz relativ zur Abtastrate.
-fn lowpass(len: usize, cutoff: f64) -> Vec<f32> {
-    let m = (len - 1) as f64;
-    let taps: Vec<f64> = (0..len)
-        .map(|i| {
-            let x = i as f64 - m / 2.0;
-            let sinc = if x == 0.0 { 2.0 * cutoff } else { (TAU * cutoff * x).sin() / (std::f64::consts::PI * x) };
-            let w = 0.42 - 0.5 * (TAU * i as f64 / m).cos() + 0.08 * (2.0 * TAU * i as f64 / m).cos();
-            sinc * w
-        })
-        .collect();
-    let sum: f64 = taps.iter().sum();
-    taps.iter().map(|t| (t / sum) as f32).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ais::message::tests::{position, static_data};
+    use crate::ais::message::examples::{position, static_data};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand_distr::{Distribution, Normal};

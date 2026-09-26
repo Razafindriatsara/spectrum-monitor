@@ -259,7 +259,7 @@ mod tests {
     fn schiff_wendet_am_routenende() {
         let s = Route::open(&[(54.0, 10.0), (54.01, 10.0)]);
         let mut ship = Ship {
-            data: match crate::ais::message::tests::static_data() {
+            data: match crate::ais::message::examples::static_data() {
                 AisMessage::Static(d) => d,
                 _ => unreachable!(),
             },

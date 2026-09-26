@@ -1,9 +1,9 @@
 //! Persistenz in SQLite: jede empfangene Nachricht als NMEA, der Positions-
 //! verlauf pro Schiff und der zusammengeführte letzte Stand jedes Schiffs.
 
-use crate::ais::message::AisMessage;
 use api::{MessageLog, TrackPoint, Vessel};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use spectrum_monitor::ais::message::AisMessage;
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -157,7 +157,7 @@ fn vessel_from_row(r: &Row) -> rusqlite::Result<Vessel> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ais::message::tests::{position, static_data};
+    use spectrum_monitor::ais::message::examples::{position, static_data};
 
     fn log(ts_ms: i64, msg_type: u8) -> MessageLog {
         MessageLog { ts_ms, channel: 'A', mmsi: 211_234_560, msg_type, nmea: vec!["!AIVDM,…".into()] }

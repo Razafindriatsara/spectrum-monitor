@@ -190,8 +190,8 @@ fn decode_static(r: &mut BitReader) -> Option<AisMessage> {
     Some(AisMessage::Static(StaticData { mmsi, imo, callsign, name, ship_type, dims, draught, destination }))
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Beispielnachrichten für Tests, auch außerhalb dieser Crate.
+pub mod examples {
     use super::*;
 
     pub fn position() -> AisMessage {
@@ -221,6 +221,12 @@ pub(crate) mod tests {
             destination: "KIEL".into(),
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::examples::{position, static_data};
+    use super::*;
 
     fn close(a: Option<f64>, b: Option<f64>) -> bool {
         (a.unwrap() - b.unwrap()).abs() < 1e-6

@@ -120,7 +120,7 @@ impl Deframer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ais::message::tests::{position, static_data};
+    use crate::ais::message::examples::{position, static_data};
 
     #[test]
     fn crc_entspricht_x25_pruefwert() {

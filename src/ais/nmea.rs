@@ -73,7 +73,7 @@ pub fn parse(line: &str) -> Option<Vec<bool>> {
 mod tests {
     use super::*;
     use crate::ais::message::AisMessage;
-    use crate::ais::message::tests::static_data;
+    use crate::ais::message::examples::static_data;
 
     #[test]
     fn echter_satz_wird_gelesen() {
