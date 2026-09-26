@@ -21,6 +21,7 @@ pub struct AppState {
     pub frames: broadcast::Sender<Bytes>,
     pub meta_json: Arc<str>,
     pub ais_events: broadcast::Sender<Arc<str>>,
+    pub signals: broadcast::Sender<Arc<str>>,
     pub store: Arc<Mutex<Store>>,
 }
 
@@ -35,9 +36,11 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/ws", get(spectrum_ws))
         .route("/ws/ais", get(ais_ws))
+        .route("/ws/signals", get(signals_ws))
         .route("/api/vessels", get(vessels))
         .route("/api/vessels/{mmsi}/track", get(track))
         .route("/api/messages", get(messages))
+        .route("/api/signal-events", get(signal_events))
         .fallback(get(frontend))
         .with_state(state)
 }
@@ -70,6 +73,10 @@ async fn spectrum_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> imp
 
 async fn ais_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| forward(socket, state.ais_events.subscribe(), |e| Message::Text(e.as_ref().into())))
+}
+
+async fn signals_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| forward(socket, state.signals.subscribe(), |e| Message::Text(e.as_ref().into())))
 }
 
 /// Leitet einen Broadcast-Kanal an einen Client weiter, bis er die Verbindung schließt.
@@ -116,4 +123,9 @@ async fn track(State(state): State<AppState>, Path(mmsi): Path<u32>, Query(q): Q
 async fn messages(State(state): State<AppState>, Query(q): Query<Limit>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).min(1_000);
     query(state.store, move |db| db.messages(limit)).await
+}
+
+async fn signal_events(State(state): State<AppState>, Query(q): Query<Limit>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).min(1_000);
+    query(state.store, move |db| db.signal_events(limit)).await
 }

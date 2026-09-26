@@ -1,7 +1,8 @@
 //! Persistenz in SQLite: jede empfangene Nachricht als NMEA, der Positions-
-//! verlauf pro Schiff und der zusammengeführte letzte Stand jedes Schiffs.
+//! verlauf pro Schiff, der zusammengeführte letzte Stand jedes Schiffs und
+//! das Protokoll der Signalereignisse.
 
-use api::{MessageLog, TrackPoint, Vessel};
+use api::{MessageLog, Signal, SignalEvent, SignalEventKind, TrackPoint, Vessel};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use spectrum_monitor::ais::message::AisMessage;
 
@@ -24,6 +25,20 @@ CREATE TABLE IF NOT EXISTS positions (
     cog REAL
 );
 CREATE INDEX IF NOT EXISTS positions_by_ship ON positions (mmsi, ts_ms);
+CREATE TABLE IF NOT EXISTS signal_events (
+    id INTEGER PRIMARY KEY,
+    ts_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    signal_id INTEGER NOT NULL,
+    center_hz REAL NOT NULL,
+    bandwidth_hz REAL NOT NULL,
+    peak_dbfs REAL NOT NULL,
+    snr_db REAL NOT NULL,
+    class TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    first_seen_ms INTEGER NOT NULL,
+    last_seen_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS vessels (
     mmsi INTEGER PRIMARY KEY,
     name TEXT,
@@ -131,6 +146,68 @@ impl Store {
     }
 }
 
+impl Store {
+    pub fn record_signal_event(&mut self, e: &SignalEvent) -> rusqlite::Result<()> {
+        let s = &e.signal;
+        self.conn.execute(
+            "INSERT INTO signal_events (ts_ms, kind, signal_id, center_hz, bandwidth_hz, peak_dbfs, snr_db,
+             class, confidence, first_seen_ms, last_seen_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                e.ts_ms,
+                kind_name(e.kind),
+                s.id as i64,
+                s.center_hz,
+                s.bandwidth_hz,
+                s.peak_dbfs,
+                s.snr_db,
+                s.class,
+                s.confidence,
+                s.first_seen_ms,
+                s.last_seen_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Die letzten `limit` Signalereignisse, neueste zuerst.
+    pub fn signal_events(&self, limit: u32) -> rusqlite::Result<Vec<SignalEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, kind, signal_id, center_hz, bandwidth_hz, peak_dbfs, snr_db, class, confidence,
+             first_seen_ms, last_seen_ms FROM signal_events ORDER BY id DESC LIMIT ?1",
+        )?;
+        stmt.query_map([limit], |r| {
+            Ok(SignalEvent {
+                ts_ms: r.get(0)?,
+                kind: match r.get::<_, String>(1)?.as_str() {
+                    "appeared" => SignalEventKind::Appeared,
+                    "reclassified" => SignalEventKind::Reclassified,
+                    _ => SignalEventKind::Lost,
+                },
+                signal: Signal {
+                    id: r.get::<_, i64>(2)? as u64,
+                    center_hz: r.get(3)?,
+                    bandwidth_hz: r.get(4)?,
+                    peak_dbfs: r.get(5)?,
+                    snr_db: r.get(6)?,
+                    class: r.get(7)?,
+                    confidence: r.get(8)?,
+                    first_seen_ms: r.get(9)?,
+                    last_seen_ms: r.get(10)?,
+                },
+            })
+        })?
+        .collect()
+    }
+}
+
+fn kind_name(kind: SignalEventKind) -> &'static str {
+    match kind {
+        SignalEventKind::Appeared => "appeared",
+        SignalEventKind::Reclassified => "reclassified",
+        SignalEventKind::Lost => "lost",
+    }
+}
+
 const VESSEL_COLUMNS: &str = "mmsi, name, callsign, ship_type, destination, length_m, beam_m, \
      lat, lon, sog, cog, heading, nav_status, last_seen_ms, messages";
 
@@ -186,5 +263,30 @@ mod tests {
         let msgs = db.messages(2).unwrap();
         assert_eq!(msgs[0].ts_ms, 5000);
         assert_eq!(msgs[0].nmea, log(0, 1).nmea);
+    }
+
+    #[test]
+    fn signalereignisse_kommen_neueste_zuerst_zurueck() {
+        let mut db = Store::open(":memory:").unwrap();
+        let signal = Signal {
+            id: 7,
+            center_hz: 161_700_000.0,
+            bandwidth_hz: 12_000.0,
+            peak_dbfs: -40.0,
+            snr_db: 30.0,
+            class: "FM".into(),
+            confidence: 0.9,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+        };
+        for (ts_ms, kind) in [(1000, SignalEventKind::Appeared), (5000, SignalEventKind::Lost)] {
+            db.record_signal_event(&SignalEvent { ts_ms, kind, signal: signal.clone() }).unwrap();
+        }
+        let events = db.signal_events(10).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            [SignalEventKind::Lost, SignalEventKind::Appeared]
+        );
+        assert_eq!(events[0].signal, signal);
     }
 }

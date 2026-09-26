@@ -8,6 +8,9 @@
 //! - `GET /api/vessels`: alle bekannten Schiffe als `Vec<Vessel>`.
 //! - `GET /api/vessels/{mmsi}/track?limit=N`: Positionsverlauf als `Vec<TrackPoint>`.
 //! - `GET /api/messages?limit=N`: letzte Nachrichten als `Vec<MessageLog>`, neueste zuerst.
+//! - `GET /ws/signals`: WebSocket mit [`SignalMessage`] (JSON): viermal pro
+//!   Sekunde alle aktiven Signale, dazu jedes Ereignis, sobald es eintritt.
+//! - `GET /api/signal-events?limit=N`: letzte Signalereignisse als `Vec<SignalEvent>`, neueste zuerst.
 
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +92,51 @@ pub struct AisEvent {
     pub vessel: Vessel,
 }
 
+/// Ein erkanntes und klassifiziertes Signal im Spektrum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Signal {
+    pub id: u64,
+    /// Absolute Mittenfrequenz in Hz.
+    pub center_hz: f64,
+    pub bandwidth_hz: f64,
+    pub peak_dbfs: f32,
+    /// Abstand der Spitze zum geschätzten Rauschen.
+    pub snr_db: f32,
+    /// Modulation, z. B. `"FM"`; `"Rauschen"` heißt Fehlalarm.
+    pub class: String,
+    /// Anteil der Stimmen für diese Klasse, 0 bis 1.
+    pub confidence: f32,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalEventKind {
+    /// Signal bestätigt und klassifiziert.
+    Appeared,
+    /// Die wahrscheinlichste Klasse hat sich geändert.
+    Reclassified,
+    /// Signal ist länger ausgeblieben, als die Haltezeit erlaubt.
+    Lost,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SignalEvent {
+    pub ts_ms: i64,
+    pub kind: SignalEventKind,
+    /// Stand des Signals zum Zeitpunkt des Ereignisses.
+    pub signal: Signal,
+}
+
+/// Nachricht auf `/ws/signals`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SignalMessage {
+    Snapshot { signals: Vec<Signal> },
+    Event { event: SignalEvent },
+}
+
 /// Navigationsstatus nach ITU-R M.1371.
 pub fn nav_status_text(status: u8) -> &'static str {
     match status {
@@ -122,5 +170,16 @@ pub fn ship_type_text(code: u8) -> &'static str {
         70..=79 => "Frachtschiff",
         80..=89 => "Tanker",
         _ => "Sonstiges",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signalnachrichten_tragen_ihren_typ() {
+        let msg = SignalMessage::Snapshot { signals: vec![] };
+        assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"snapshot","signals":[]}"#);
     }
 }

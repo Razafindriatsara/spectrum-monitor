@@ -1,10 +1,14 @@
+mod scanner;
 mod server;
 mod store;
 
 use axum::body::Bytes;
 use clap::Parser;
 use rustfft::num_complex::Complex32;
+use scanner::Scanner;
 use spectrum_monitor::ais::{self, AisMessage, AisReceiver, ReceivedFrame, nmea};
+use spectrum_monitor::classify::Classifier;
+use spectrum_monitor::detect::CfarConfig;
 use spectrum_monitor::dsp::{Detector, SpectrumEstimator};
 use spectrum_monitor::source::{IqSource, SimulatedSource};
 use std::net::UdpSocket;
@@ -13,7 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::broadcast;
 
-/// Echtzeit-Spektrumüberwachung mit AIS-Empfang und Web-Oberfläche.
+/// Das trainierte Modell der Modulationsklassifikation, erzeugt mit
+/// `cargo run --release --features train --bin train`.
+const MODEL: &[u8] = include_bytes!("../models/modulation.onnx");
+
+/// Echtzeit-Spektrumüberwachung mit AIS-Empfang, Signaldetektion und Web-Oberfläche.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -38,6 +46,9 @@ struct Args {
     /// Sendet jede Nachricht als NMEA per UDP, z. B. an OpenCPN auf 127.0.0.1:10110.
     #[arg(long)]
     nmea_udp: Option<String>,
+    /// So weit muss ein Signal über dem geschätzten Rauschen liegen, in dB.
+    #[arg(long, default_value_t = 10.0)]
+    cfar_db: f32,
 }
 
 #[tokio::main]
@@ -62,30 +73,45 @@ async fn main() {
         socket
     });
 
+    let classifier = Classifier::from_bytes(MODEL).expect("Klassifikationsmodell lässt sich nicht laden");
+    let cfar = CfarConfig { threshold_db: args.cfar_db, ..Default::default() };
+    let scanner =
+        Scanner::new(classifier, source.sample_rate(), source.center_freq(), args.fft_size, 1.0 / args.fps, cfar);
+
     let (tx, _) = broadcast::channel::<Bytes>(16);
     let (ais_tx, _) = broadcast::channel(256);
+    let (signal_tx, _) = broadcast::channel(64);
     let (frame_tx, frame_rx) = mpsc::channel();
+    // Wenige Blöcke Puffer: Hängt die Klassifikation, fallen Blöcke weg, die
+    // Erfassung läuft weiter.
+    let (block_tx, block_rx) = mpsc::sync_channel(4);
 
     let producer = tx.clone();
     let (fps, detector) = (args.fps, args.detector);
-    std::thread::spawn(move || acquisition_loop(source, estimator, receiver, fps, detector, producer, frame_tx));
+    std::thread::spawn(move || {
+        acquisition_loop(source, estimator, receiver, fps, detector, producer, frame_tx, block_tx)
+    });
     let (events, db) = (ais_tx.clone(), store.clone());
     std::thread::spawn(move || ais_pipeline(frame_rx, db, events, udp));
+    let (signals, db) = (signal_tx.clone(), store.clone());
+    std::thread::spawn(move || scan_loop(block_rx, scanner, db, signals));
 
     let app = server::router(server::AppState {
         frames: tx,
         meta_json: serde_json::to_string(&meta).expect("serialisierbar").into(),
         ais_events: ais_tx,
+        signals: signal_tx,
         store,
     });
     let listener = tokio::net::TcpListener::bind(&args.bind).await.expect("Adresse ist belegt");
-    println!("Spektrum und AIS laufen auf http://{}", args.bind);
+    println!("Spektrum, AIS und Signalüberwachung laufen auf http://{}", args.bind);
     axum::serve(listener, app).await.expect("Server-Fehler");
 }
 
 /// Liest pro Frame genau die Samples, die in 1/fps Sekunden anfallen, damit
 /// die Anzeige in Echtzeit läuft und keine Signalzeit verloren geht. Derselbe
-/// Block geht an die Spektrumschätzung und an den AIS-Empfänger.
+/// Block geht an die Spektrumschätzung, den AIS-Empfänger und den Scanner.
+#[allow(clippy::too_many_arguments)]
 fn acquisition_loop(
     mut source: impl IqSource,
     mut estimator: SpectrumEstimator,
@@ -94,12 +120,14 @@ fn acquisition_loop(
     detector: Detector,
     tx: broadcast::Sender<Bytes>,
     frames: mpsc::Sender<ReceivedFrame>,
+    blocks: mpsc::SyncSender<Arc<[Complex32]>>,
 ) {
     let per_frame = (source.sample_rate() / fps) as usize;
     let mut buf = vec![Complex32::ZERO; per_frame];
     let period = Duration::from_secs_f64(1.0 / fps);
     let mut next = Instant::now();
     let mut warned = false;
+    let mut dropped = false;
 
     loop {
         source.read(&mut buf);
@@ -111,6 +139,12 @@ fn acquisition_loop(
             if frames.send(frame).is_err() {
                 return;
             }
+        }
+        if let Err(mpsc::TrySendError::Full(_)) = blocks.try_send(Arc::from(buf.as_slice()))
+            && !dropped
+        {
+            eprintln!("Warnung: Signalüberwachung kommt nicht hinterher, Blöcke werden übersprungen.");
+            dropped = true;
         }
 
         next += period;
@@ -144,7 +178,7 @@ fn ais_pipeline(
             seq_id = (seq_id + 1) % 10;
         }
         let msg_type = frame.payload.iter().take(6).fold(0u8, |a, &b| a << 1 | u8::from(b));
-        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        let ts_ms = now_ms();
         let message = api::MessageLog { ts_ms, channel: frame.channel.letter(), mmsi, msg_type, nmea };
 
         if let Some(socket) = &udp {
@@ -162,4 +196,31 @@ fn ais_pipeline(
         let event = api::AisEvent { message, vessel };
         let _ = events.send(serde_json::to_string(&event).expect("serialisierbar").into());
     }
+}
+
+/// Signalüberwachung: speichert Ereignisse und verteilt Ereignisse und
+/// Übersichten an die Clients.
+fn scan_loop(
+    blocks: mpsc::Receiver<Arc<[Complex32]>>,
+    mut scanner: Scanner,
+    store: Arc<Mutex<Store>>,
+    tx: broadcast::Sender<Arc<str>>,
+) {
+    let json = |m: &api::SignalMessage| -> Arc<str> { serde_json::to_string(m).expect("serialisierbar").into() };
+    for block in blocks {
+        let out = scanner.process(&block, now_ms());
+        for event in out.events {
+            if let Err(e) = store.lock().expect("Datenbank-Mutex vergiftet").record_signal_event(&event) {
+                eprintln!("Speichern fehlgeschlagen: {e}");
+            }
+            let _ = tx.send(json(&api::SignalMessage::Event { event }));
+        }
+        if let Some(signals) = out.snapshot {
+            let _ = tx.send(json(&api::SignalMessage::Snapshot { signals }));
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
