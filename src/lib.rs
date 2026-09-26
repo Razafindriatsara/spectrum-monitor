@@ -3,4 +3,5 @@
 
 pub mod ais;
 pub mod dsp;
+pub mod signals;
 pub mod source;

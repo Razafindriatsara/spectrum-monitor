@@ -3,12 +3,13 @@
 //! ohne dass sich DSP oder Server ändern müssen.
 
 use crate::ais::{self, Channel, fleet::Fleet, gmsk::BAUD};
+use crate::dsp::Oscillator;
+use crate::signals::{Modulation, Nco, Qpsk};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use rustfft::num_complex::Complex32;
 use std::collections::VecDeque;
-use std::f64::consts::TAU;
 
 pub trait IqSource: Send {
     /// Abtastrate in Samples pro Sekunde.
@@ -17,18 +18,6 @@ pub trait IqSource: Send {
     fn center_freq(&self) -> f64;
     /// Füllt `buf` mit den nächsten Samples, lückenlos in Echtzeit-Signalzeit.
     fn read(&mut self, buf: &mut [Complex32]);
-}
-
-/// Numerisch gesteuerter Oszillator: hält die Phase über Blockgrenzen hinweg.
-struct Nco {
-    phase: f64,
-}
-
-impl Nco {
-    fn next(&mut self, freq: f64, fs: f64) -> Complex32 {
-        self.phase = (self.phase + TAU * freq / fs) % TAU;
-        Complex32::new(self.phase.cos() as f32, self.phase.sin() as f32)
-    }
 }
 
 /// Ein AIS-Kanal: sendet fertig modulierte Bursts nacheinander, mit mindestens
@@ -49,8 +38,7 @@ struct Burst {
 
 /// Frequenzspringer: wechselt alle 50 ms auf eine zufällige Frequenz.
 struct Hopper {
-    nco: Nco,
-    freq: f64,
+    osc: Oscillator,
     left: usize,
 }
 
@@ -59,12 +47,17 @@ pub struct SimulatedSource {
     fc: f64,
     rng: StdRng,
     noise: Normal<f32>,
-    carrier: Nco,
-    fm: Nco,
-    fm_mod: Nco,
+    emitters: Vec<Emitter>,
     hopper: Hopper,
     fleet: Fleet,
     ais: [AisChannel; 2],
+}
+
+/// Dauersender auf fester Frequenz.
+struct Emitter {
+    carrier: Oscillator,
+    amplitude: f32,
+    modulation: Modulation,
 }
 
 const HOP_S: f64 = 0.05;
@@ -81,7 +74,7 @@ impl SimulatedSource {
         let mut rng = StdRng::seed_from_u64(seed);
         let ais = [Channel::A, Channel::B].map(|ch| AisChannel {
             offset: ch.freq_hz() - fc,
-            nco: Nco { phase: 0.0 },
+            nco: Nco::default(),
             queue: VecDeque::new(),
             current: None,
             pos: 0,
@@ -92,14 +85,25 @@ impl SimulatedSource {
             fc,
             fleet: Fleet::kiel(&mut rng),
             noise: Normal::new(0.0, 0.003).expect("gültige Standardabweichung"),
-            carrier: Nco { phase: 0.0 },
-            fm: Nco { phase: 0.0 },
-            fm_mod: Nco { phase: 0.0 },
-            hopper: Hopper { nco: Nco { phase: 0.0 }, freq: 700_000.0, left: 0 },
+            emitters: vec![
+                // Unmodulierter Träger, z. B. eine Bake.
+                emitter(-600_000.0, fs, 0.05, Modulation::Carrier),
+                // Schmalband-FM: 1-kHz-Ton mit 5 kHz Hub.
+                emitter(-300_000.0, fs, 0.02, Modulation::fm(1_000.0, 5_000.0)),
+                // AM-Sprechfunk, hier als 800-Hz-Ton mit 70 % Modulationsgrad.
+                emitter(-900_000.0, fs, 0.03, Modulation::am(800.0, 0.7)),
+                // Digitaler Datenfunk: QPSK mit 9600 Symbolen pro Sekunde.
+                emitter(-450_000.0, fs, 0.02, Modulation::Qpsk(Qpsk::new(9_600.0, 0.35))),
+            ],
+            hopper: Hopper { osc: Oscillator::new(700_000.0, fs), left: 0 },
             ais,
             rng,
         }
     }
+}
+
+fn emitter(offset: f64, fs: f64, amplitude: f32, modulation: Modulation) -> Emitter {
+    Emitter { carrier: Oscillator::new(offset, fs), amplitude, modulation }
 }
 
 impl AisChannel {
@@ -144,20 +148,18 @@ impl IqSource for SimulatedSource {
             self.ais[ch as usize].queue.push_back(Burst { freq, amplitude });
         }
         for s in buf.iter_mut() {
-            // Dauerträger, z. B. eine Bake.
-            let mut v = self.carrier.next(-600_000.0, fs) * 0.05;
-
-            // Schmalband-FM: 1-kHz-Ton mit 5 kHz Hub.
-            let m = self.fm_mod.next(1_000.0, fs).re as f64;
-            v += self.fm.next(-300_000.0 + 5_000.0 * m, fs) * 0.02;
+            let mut v = Complex32::ZERO;
+            for e in &mut self.emitters {
+                v += e.carrier.sample() * e.modulation.next(fs, &mut self.rng) * e.amplitude;
+            }
 
             // Frequenzspringer im oberen Teil des Spektrums.
             if self.hopper.left == 0 {
-                self.hopper.freq = self.rng.random_range(250_000.0..1_100_000.0);
+                self.hopper.osc = Oscillator::new(self.rng.random_range(250_000.0..1_100_000.0), fs);
                 self.hopper.left = (HOP_S * fs) as usize;
             }
             self.hopper.left -= 1;
-            v += self.hopper.nco.next(self.hopper.freq, fs) * 0.01;
+            v += self.hopper.osc.sample() * 0.01;
 
             for ch in &mut self.ais {
                 v += ch.next(fs);
