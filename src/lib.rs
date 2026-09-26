@@ -1,6 +1,6 @@
 //! Signalverarbeitung des Spectrum Monitors: IQ-Quellen, Spektrum, AIS,
-//! Signaldetektion und Modulationsklassifikation.
-//! Der Server (`main.rs`) baut darauf auf.
+//! Signaldetektion und Modulationsklassifikation. Der Server (`main.rs`) und
+//! der Trainer (`src/bin/train`) bauen darauf auf.
 
 pub mod ais;
 pub mod classify;
