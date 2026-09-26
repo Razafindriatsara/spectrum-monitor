@@ -1,9 +1,11 @@
 //! Spektrum und Wasserfall auf zwei Canvas-Flächen, mit Marker, Max-Hold und
-//! einstellbarem Pegelbereich.
+//! einstellbarem Pegelbereich. Erkannte Signale erscheinen als farbige Bänder
+//! mit ihrer Modulation, daneben Signalliste und Ereignisprotokoll.
 
-use crate::format::{dbfs, mhz};
+use crate::app::SignalState;
+use crate::format::{clock, dbfs, mhz, num};
 use crate::live;
-use api::SpectrumMeta;
+use api::{Signal, SignalEventKind, SpectrumMeta};
 use gloo_net::websocket::Message;
 use leptos::html;
 use leptos::prelude::*;
@@ -16,6 +18,18 @@ const SEA: &str = "#0e2233";
 const GRID: &str = "#24445c";
 const MUTED: &str = "#7f9ab0";
 const TRACE: &str = "#f2b544";
+
+/// Farbe und CSS-Klasse je Modulation, wie `.cls-*` in style.css.
+pub fn class_style(class: &str) -> (&'static str, &'static str) {
+    match class {
+        "Träger" => ("#b9a6e8", "cls-carrier"),
+        "AM" => ("#e0796b", "cls-am"),
+        "FM" => ("#8fd18b", "cls-fm"),
+        "GMSK" => ("#5cc8e0", "cls-gmsk"),
+        "QPSK" => ("#e8a3cf", "cls-qpsk"),
+        _ => (MUTED, "cls-noise"),
+    }
+}
 
 /// Anzeigeeinstellungen, die jede Zeichnung braucht.
 #[derive(Clone, Copy)]
@@ -36,7 +50,7 @@ struct Scope {
 }
 
 #[component]
-pub fn Spectrum(meta: RwSignal<Option<SpectrumMeta>>, live: RwSignal<bool>) -> impl IntoView {
+pub fn Spectrum(meta: RwSignal<Option<SpectrumMeta>>, live: RwSignal<bool>, sig: SignalState) -> impl IntoView {
     let ref_db = RwSignal::new(-10.0);
     let range = RwSignal::new(70.0);
     let hold_on = RwSignal::new(false);
@@ -55,7 +69,9 @@ pub fn Spectrum(meta: RwSignal<Option<SpectrumMeta>>, live: RwSignal<bool>) -> i
     let scale = move || Scale { ref_db: ref_db.get_untracked(), range: range.get_untracked() };
     let draw = move || {
         let m = meta.get_untracked();
-        let r = scope.with_value(|s| s.as_ref().and_then(|s| s.draw(m.as_ref(), scale(), marker.get_untracked())));
+        let r = sig.signals.with_untracked(|signals| {
+            scope.with_value(|s| s.as_ref().and_then(|s| s.draw(m.as_ref(), scale(), marker.get_untracked(), signals)))
+        });
         readout.set(r);
     };
     // Höchstens einmal pro Bildschirmaktualisierung zeichnen.
@@ -99,14 +115,22 @@ pub fn Spectrum(meta: RwSignal<Option<SpectrumMeta>>, live: RwSignal<bool>) -> i
         on_resize.forget(); // lebt so lange wie die Seite
     });
 
-    // Neu zeichnen, wenn sich Einstellungen oder der Marker ändern.
+    // Neu zeichnen, wenn sich Einstellungen, Marker oder Signale ändern.
     Effect::new(move |_| {
         ref_db.track();
         range.track();
         marker.track();
         meta.track();
+        sig.signals.track();
         schedule();
     });
+    // Marker auf ein Signal setzen, etwa aus der Signalliste.
+    let mark = move |hz: f64| {
+        if let Some(m) = meta.get_untracked() {
+            let f = (hz - (m.center_hz - m.sample_rate / 2.0)) / m.sample_rate;
+            marker.set(Some(f * width.get_untracked()));
+        }
+    };
     Effect::new(move |_| {
         let on = hold_on.get();
         scope.update_value(|s| {
@@ -201,6 +225,53 @@ pub fn Spectrum(meta: RwSignal<Option<SpectrumMeta>>, live: RwSignal<bool>) -> i
             <button on:click=move |_| paused.update(|p| *p = !*p)>
                 {move || if paused.get() { "Fortsetzen" } else { "Anhalten" }}
             </button>
+            <section>
+                <h2>"Signale"</h2>
+                {move || sig.signals.with(Vec::is_empty).then(|| view! {
+                    <p class="muted">"Noch kein Signal bestätigt."</p>
+                })}
+                <ul class="list">
+                    {move || sig.signals.with(|signals| signals.iter().map(|s| {
+                        let hz = s.center_hz;
+                        view! {
+                            <li>
+                                <button title="Marker auf dieses Signal" on:click=move |_| mark(hz)>
+                                    <span class=format!("dot {}", class_style(&s.class).1)></span>
+                                    <span>{format!("{} · {}", s.class, mhz(s.center_hz))}</span>
+                                    <span class="muted">{format!("{} %", (s.confidence * 100.0).round())}</span>
+                                </button>
+                            </li>
+                        }
+                    }).collect_view())}
+                </ul>
+            </section>
+            <section>
+                <h2>"Ereignisse"</h2>
+                <ul class="log">
+                    {move || sig.events.with(|events| events.iter().take(15).map(|e| {
+                        let what = match e.kind {
+                            SignalEventKind::Appeared => "neu",
+                            SignalEventKind::Reclassified => "neu eingestuft",
+                            SignalEventKind::Lost => "verschwunden",
+                        };
+                        let s = &e.signal;
+                        view! {
+                            <li>
+                                <div class="row">
+                                    <span>{format!("{} · {} {}", clock(e.ts_ms), s.class, what)}</span>
+                                    <span class="muted">{mhz(s.center_hz)}</span>
+                                </div>
+                                <code>{format!(
+                                    "{} kHz breit · SNR {} dB · {} % sicher",
+                                    num(s.bandwidth_hz / 1e3, 1),
+                                    num(s.snr_db.into(), 0),
+                                    (s.confidence * 100.0).round()
+                                )}</code>
+                            </li>
+                        }
+                    }).collect_view())}
+                </ul>
+            </section>
             <p class="hint">"Mit der Maus oder den Pfeiltasten misst der Marker Frequenz und Pegel. Umschalt + Pfeil springt weiter."</p>
         </aside>
     }
@@ -310,7 +381,7 @@ impl Scope {
     }
 
     /// Zeichnet das Spektrum und liefert den Messwert unter dem Marker.
-    fn draw(&self, meta: Option<&SpectrumMeta>, s: Scale, marker: Option<f64>) -> Option<String> {
+    fn draw(&self, meta: Option<&SpectrumMeta>, s: Scale, marker: Option<f64>, signals: &[Signal]) -> Option<String> {
         let c = &self.sctx;
         let (w, h, d) = (f64::from(self.spec.width()), f64::from(self.spec.height()), dpr());
         c.set_fill_style_str(SEA);
@@ -343,6 +414,25 @@ impl Scope {
             let t = format!("{:.3}", freq_at(meta, f64::from(i) / 10.0) / 1e6);
             let tw = c.measure_text(&t).map_or(0.0, |m| m.width());
             let _ = c.fill_text(&t, f64::from(i) * w / 10.0 - tw / 2.0, h - 4.0 * d);
+        }
+
+        // Erkannte Signale: Band über die belegte Breite, darüber Klasse und Sicherheit.
+        // Die Beschriftungen stehen abwechselnd in zwei Zeilen, damit sich
+        // benachbarte nicht überdecken.
+        let x_of = |hz: f64| (hz - (meta.center_hz - meta.sample_rate / 2.0)) / meta.sample_rate * w;
+        c.set_text_baseline("top");
+        for (i, sig) in signals.iter().enumerate() {
+            let (color, _) = class_style(&sig.class);
+            let x0 = x_of(sig.center_hz - sig.bandwidth_hz / 2.0);
+            let x1 = x_of(sig.center_hz + sig.bandwidth_hz / 2.0).max(x0 + 3.0 * d);
+            c.set_fill_style_str(color);
+            c.set_global_alpha(0.18);
+            c.fill_rect(x0, 0.0, x1 - x0, h);
+            c.set_global_alpha(1.0);
+            let label = format!("{} {} %", sig.class, (sig.confidence * 100.0).round());
+            let tw = c.measure_text(&label).map_or(0.0, |m| m.width());
+            let x = ((x0 + x1) / 2.0 - tw / 2.0).clamp(0.0, w - tw);
+            let _ = c.fill_text(&label, x, (24.0 + 16.0 * (i % 2) as f64) * d);
         }
 
         let trace = |v: &[f32], color: &str, dash: bool| {

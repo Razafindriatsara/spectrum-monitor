@@ -37,7 +37,7 @@ h2 { font-size: 1rem; font-weight: 600; margin: 0; }
 .status.live { color: var(--trace); }
 
 main { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; }
-.view { display: grid; grid-template-columns: minmax(0, 1fr) 15rem; min-height: 0; }
+.view { display: grid; grid-template-columns: minmax(0, 1fr) 19rem; min-height: 0; }
 .view.ships { grid-template-columns: minmax(0, 1fr) 23rem; }
 
 /* Spektrum und Wasserfall */
@@ -120,6 +120,13 @@ button:hover { border-color: var(--text); }
 .dot.cargo { background: var(--cargo); }
 .dot.tanker { background: var(--tanker); }
 .dot.other { background: var(--other); }
+/* Modulationen, Farben wie class_style in src/spectrum.rs */
+.dot.cls-carrier { background: #b9a6e8; }
+.dot.cls-am { background: #e0796b; }
+.dot.cls-fm { background: #8fd18b; }
+.dot.cls-gmsk { background: #5cc8e0; }
+.dot.cls-qpsk { background: #e8a3cf; }
+.dot.cls-noise { background: var(--muted); }
 dl { display: grid; grid-template-columns: auto 1fr; gap: .2rem 1rem; margin: 0; }
 dt { color: var(--muted); }
 dd { margin: 0; }
